@@ -4620,74 +4620,84 @@ async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
 ) -> Result<Vec<AssistantEvent>, ApiError> {
-    let mut stream = client.stream_message(message_request).await?;
-    let mut events = Vec::new();
-    let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-    let mut saw_stop = false;
+    // Attempt streaming first; if it fails entirely, fall back to non-streaming.
+    let stream_result: Result<Vec<AssistantEvent>, ApiError> = (async {
+        let mut stream = client.stream_message(message_request).await?;
+        let mut events = Vec::new();
+        let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+        let mut saw_stop = false;
 
-    while let Some(event) = stream.next_event().await? {
-        match event {
-            ApiStreamEvent::MessageStart(start) => {
-                for block in start.message.content {
-                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
-                }
-            }
-            ApiStreamEvent::ContentBlockStart(start) => {
-                push_output_block(
-                    start.content_block,
-                    start.index,
-                    &mut events,
-                    &mut pending_tools,
-                    true,
-                );
-            }
-            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty() {
-                        events.push(AssistantEvent::TextDelta(text));
+        while let Some(event) = stream.next_event().await? {
+            match event {
+                ApiStreamEvent::MessageStart(start) => {
+                    for block in start.message.content {
+                        push_output_block(block, 0, &mut events, &mut pending_tools, true);
                     }
                 }
-                ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                        input.push_str(&partial_json);
+                ApiStreamEvent::ContentBlockStart(start) => {
+                    push_output_block(
+                        start.content_block,
+                        start.index,
+                        &mut events,
+                        &mut pending_tools,
+                        true,
+                    );
+                }
+                ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                    ContentBlockDelta::TextDelta { text } => {
+                        if !text.is_empty() {
+                            events.push(AssistantEvent::TextDelta(text));
+                        }
+                    }
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                            input.push_str(&partial_json);
+                        }
+                    }
+                    ContentBlockDelta::ThinkingDelta { .. }
+                    | ContentBlockDelta::SignatureDelta { .. } => {}
+                },
+                ApiStreamEvent::ContentBlockStop(stop) => {
+                    if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                        events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
-            },
-            ApiStreamEvent::ContentBlockStop(stop) => {
-                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input });
+                ApiStreamEvent::MessageDelta(delta) => {
+                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                }
+                ApiStreamEvent::MessageStop(_) => {
+                    saw_stop = true;
+                    events.push(AssistantEvent::MessageStop);
                 }
             }
-            ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-            }
-            ApiStreamEvent::MessageStop(_) => {
-                saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
-            }
+        }
+
+        push_prompt_cache_record(client, &mut events);
+
+        if !saw_stop
+            && events.iter().any(|event| {
+                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                    || matches!(event, AssistantEvent::ToolUse { .. })
+            })
+        {
+            events.push(AssistantEvent::MessageStop);
+        }
+
+        Ok(events)
+    })
+    .await;
+
+    // If streaming succeeded and produced a complete message, return it
+    if let Ok(ref events) = stream_result {
+        if events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::MessageStop))
+        {
+            return stream_result;
         }
     }
 
-    push_prompt_cache_record(client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
-    }
-
-    if events
-        .iter()
-        .any(|event| matches!(event, AssistantEvent::MessageStop))
-    {
-        return Ok(events);
-    }
-
+    // Fallback: use non-streaming request (handles stream failures and incomplete streams)
     let response = client
         .send_message(&MessageRequest {
             stream: false,
